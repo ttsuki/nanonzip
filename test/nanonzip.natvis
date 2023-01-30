@@ -10,4 +10,22 @@
             <![CDATA[{{name={(char*)(this+1),[filename_length]s}, size={uncompressed_size}, comp_size={compressed_size}, algo={compression_method}}}]]>
         </DisplayString>
     </Type>
+    <Type Name="nanonzip::inflate::huffman_decoder::symbol_entry">
+        <DisplayString Condition="length==1"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==2"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==3"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==4"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==5"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==6"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==7"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==8"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==9"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==10"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==11"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==12"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>11&1}{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==13"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>12&1}{code>>11&1}{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==14"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>13&1}{code>>12&1}{code>>11&1}{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==15"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>14&1}{code>>13&1}{code>>12&1}{code>>11&1}{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+        <DisplayString Condition="length==16"><![CDATA[{{ symbol='{(short)symbol,xb}' code="{code>>15&1}{code>>14&1}{code>>13&1}{code>>12&1}{code>>11&1}{code>>10&1}{code>>9&1}{code>>8&1}{code>>7&1}{code>>6&1}{code>>5&1}{code>>4&1}{code>>3&1}{code>>2&1}{code>>1&1}{code>>0&1}" }}]]></DisplayString>
+    </Type>
 </AutoVisualizer>

@@ -3,7 +3,28 @@
 /// @author (C) 2023 ttsuki
 /// MIT License
 
+#define NANONZIP_EXPORT
 #include "nanonzip.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <climits>
+#include <cstring>
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <istream>
+#include <fstream>
+#include <filesystem>
+#include <functional>
+#include <stdexcept>
+#include <array>
+#include <vector>
+#include <type_traits>
+#include <algorithm>
+#include <utility>
 
 #ifndef NANONZIP_EXPORT
 #define NANONZIP_EXPORT
@@ -354,6 +375,481 @@ namespace nanonzip
         }
     };
 
+    // DEFLATE Compressed Data Format Specification version 1.3
+    // https://www.ietf.org/rfc/rfc1951.txt
+    namespace inflate
+    {
+        // Input bit stream
+        class bit_stream
+        {
+            static constexpr inline size_t input_buffer_size = 65536;
+            std::function<size_t(void* buf, size_t len)> read_{};
+            std::vector<std::byte> input_buffer_{};
+            std::basic_string_view<std::byte> buffered_input_{};
+            std::uintptr_t local{};
+            unsigned local_buffered_{};
+
+        public:
+            bit_stream(std::function<size_t(void* buf, size_t len)> upstream) : read_(std::move(upstream)), input_buffer_(input_buffer_size) {}
+            bit_stream(const bit_stream& other) = delete;
+            bit_stream(bit_stream&& other) noexcept = delete;
+            bit_stream& operator=(const bit_stream& other) = delete;
+            bit_stream& operator=(bit_stream&& other) noexcept = delete;
+            ~bit_stream() = default;
+
+            void fill(unsigned n)
+            {
+                n = static_cast<unsigned>(std::min<size_t>(CHAR_BIT * (sizeof(local) - 1), n));
+                while (local_buffered_ < n)
+                {
+                    if (buffered_input_.empty())
+                    {
+                        buffered_input_ = std::basic_string_view<std::byte>{
+                            input_buffer_.data(),
+                            read_(input_buffer_.data(), input_buffer_.size())
+                        };
+                    }
+
+                    if (!buffered_input_.empty())
+                    {
+                        local |= static_cast<decltype(local)>(buffered_input_.front()) << local_buffered_;
+                        buffered_input_.remove_prefix(1);
+                    }
+
+                    local_buffered_ += CHAR_BIT;
+                }
+            }
+
+            [[nodiscard]] unsigned peek(unsigned n)
+            {
+                if (n > local_buffered_)
+                {
+                    fill(n);
+                    if (n > local_buffered_) throw std::runtime_error("argument n out of range");
+                }
+                return local & ((1u << n) - 1);
+            }
+
+            [[nodiscard]] unsigned read(unsigned n)
+            {
+                auto v = peek(n);
+                local = local >> n;
+                local_buffered_ -= n;
+                return v;
+            }
+
+            void seek_to_next_byte()
+            {
+                (void)read(local_buffered_ % CHAR_BIT);
+            }
+        };
+
+        // Huffman code decoder
+        class huffman_decoder
+        {
+        public:
+            using symbol_t = unsigned;
+            using code_t = unsigned;
+            using code_length_t = unsigned;
+
+            huffman_decoder() = default;
+
+            huffman_decoder(const code_length_t code_lengths[], size_t length_count)
+                : symbol_table_(build_symbol_table(code_lengths, length_count))
+                , index_table_(build_index_table(symbol_table_))
+                , lookup_table_(build_symbol_lookup_table(symbol_table_)) { }
+
+            huffman_decoder(const huffman_decoder& other) = default;
+            huffman_decoder(huffman_decoder&& other) noexcept = default;
+            huffman_decoder& operator=(const huffman_decoder& other) = default;
+            huffman_decoder& operator=(huffman_decoder&& other) noexcept = default;
+            ~huffman_decoder() = default;
+
+            symbol_t read_next(bit_stream& bit_stream) const
+            {
+                code_t input = bit_stream.peek(MAX_BITS);
+                if (auto e = lookup(lookup_table_, input); e.length) { return (void)bit_stream.read(e.length), e.symbol; }
+                if (auto e = lookup(symbol_table_, index_table_, input); e.length) { return (void)bit_stream.read(e.length), e.symbol; }
+                throw std::runtime_error("invalid bit stream: not registered huffman code");
+            }
+
+        private:
+            static inline constexpr code_length_t MAX_BITS = 15;
+            static inline constexpr code_length_t LUT_MAX_BITS = 12; // 4B*(1<<12) = 16KiB table
+
+            struct symbol_entry
+            {
+                code_length_t length : 16;
+                symbol_t symbol : 16;
+#ifdef _DEBUG
+                code_t code = code_t{};
+#endif
+            };
+
+            struct range
+            {
+                code_t first;
+                code_t last;
+                size_t base_index;
+            };
+
+            using symbol_table = std::vector<symbol_entry>;
+            using symbol_index_table = std::vector<range>;
+            using symbol_lookup_table = std::vector<symbol_entry>;
+
+            static symbol_table build_symbol_table(const code_length_t code_lengths[], size_t length_count)
+            {
+                symbol_table symbols;
+                symbols.reserve(length_count);
+
+                for (size_t i = 0; i < length_count; ++i)
+                    if (code_lengths[i] != 0)
+                        symbols.push_back(symbol_entry{code_lengths[i], static_cast<symbol_t>(i),});
+
+                // sort by length
+                std::stable_sort(symbols.begin(), symbols.end(), [](symbol_entry a, symbol_entry b) { return a.length < b.length; });
+
+#ifdef _DEBUG
+                auto it = symbols.begin();
+                code_t code = 0;
+                for (code_length_t bits = 0; bits <= MAX_BITS; ++bits, code <<= 1)
+                    for (; it != symbols.end() && it->length == bits; ++it, ++code)
+                        it->code = code;
+#endif
+                return symbols;
+            }
+
+            static symbol_index_table build_index_table(const symbol_table& symbols)
+            {
+                symbol_index_table map{};
+                map.reserve(MAX_BITS + 1);
+
+                code_t code = 0;
+                auto it = symbols.begin();
+                for (code_length_t bits = 0; bits <= MAX_BITS; ++bits, code <<= 1)
+                {
+                    range m{};
+                    m.first = code;
+                    m.base_index = it - symbols.begin();
+                    for (; it != symbols.end() && it->length == bits; ++it, ++code) (void)code;
+                    m.last = code;
+                    map.push_back(m);
+                }
+                return map;
+            }
+
+            static symbol_entry lookup(const symbol_table& symbols, const symbol_index_table& map, code_t input)
+            {
+                code_t code = 0;
+                for (code_length_t bits = 0; bits <= MAX_BITS; ++bits)
+                {
+                    if (const auto& m = map[bits]; /* m.first <= code && */ code < m.last)
+                        return symbols[m.base_index + (code - m.first)];
+
+                    code = (code << 1) | (input & 1u);
+                    input = input >> 1;
+                }
+                return symbol_entry{}; // not found
+            }
+
+            static symbol_lookup_table build_symbol_lookup_table(const symbol_table& symbols)
+            {
+                symbol_lookup_table lut(1u << LUT_MAX_BITS);
+
+                code_t code = 0;
+                auto it = symbols.begin();
+                for (code_length_t bits = 0; bits <= LUT_MAX_BITS; ++bits, code <<= 1)
+                {
+                    for (; it != symbols.end() && it->length == bits; ++it, ++code)
+                    {
+                        static_assert(LUT_MAX_BITS <= 16);
+                        unsigned reversed = code;                                         // 16bit bit-reverse
+                        reversed = ((reversed & 0x5555) << 1) | (reversed >> 1 & 0x5555); // 0b0101010101010101
+                        reversed = ((reversed & 0x3333) << 2) | (reversed >> 2 & 0x3333); // 0b0011001100110011
+                        reversed = ((reversed & 0x0F0F) << 4) | (reversed >> 4 & 0x0F0F); // 0b0000111100001111
+                        reversed = ((reversed & 0x00FF) << 8) | (reversed >> 8 & 0x00FF); // 0x0000000011111111
+
+                        const code_t fixed_bits = static_cast<code_t>(reversed >> (16 - bits)); // lower `bits` bits are bit-reversed code
+                        for (code_t free_bits = 0, inc = 1 << bits; free_bits < lut.size(); free_bits += inc)
+                            lut[free_bits | fixed_bits] = *it;
+                    }
+                }
+
+                return lut;
+            }
+
+            static symbol_entry lookup(const symbol_lookup_table& lut, code_t input)
+            {
+                constexpr code_t mask = (1u << LUT_MAX_BITS) - 1;
+                return lut[input & mask];
+            }
+
+            symbol_table symbol_table_{};
+            symbol_index_table index_table_{};
+            symbol_lookup_table lookup_table_{};
+        };
+
+        // Output windowed buffer
+        class window
+        {
+            using byte = unsigned char;
+            static constexpr inline size_t window_size_ = 1u << 16;
+            std::vector<byte> buffer_ = std::vector<byte>(window_size_, 0);
+            size_t cursor_{0};
+
+        public:
+            window() = default;
+            window(const window& other) = delete;
+            window(window&& other) noexcept = delete;
+            window& operator=(const window& other) = delete;
+            window& operator=(window&& other) noexcept = delete;
+            ~window() = default;
+            byte put(byte b) { return buffer_[cursor_++ & (window_size_ - 1)] = b; }
+            size_t cursor() const { return cursor_; }
+            byte reput(ptrdiff_t distance) { return put(buffer_[(cursor_ + distance) & (window_size_ - 1)]); }
+        };
+
+        static constexpr size_t nr_clen_alphabets = 19;
+        static constexpr size_t nr_lit_alphabets = 286;
+        static constexpr size_t nr_dist_alphabets = 32;
+
+        static std::tuple<huffman_decoder, huffman_decoder> build_fixed_huffman_code_decoder()
+        // -> std::tuple<literals_decoder, distance_decoder>
+        {
+            std::array<huffman_decoder::code_length_t, nr_lit_alphabets> huff_lit_code_len{};
+            std::array<huffman_decoder::code_length_t, nr_dist_alphabets> huff_dist_code_len{};
+
+            size_t i = 0;
+            for (; i < 144; i++) huff_lit_code_len[i] = 8; // 00110000  through 10111111
+            for (; i < 256; i++) huff_lit_code_len[i] = 9; // 110010000 through 111111111
+            for (; i < 280; i++) huff_lit_code_len[i] = 7; // 0000000   through 0010111
+            for (; i < 286; i++) huff_lit_code_len[i] = 8; // 11000000  through 11000111
+            for (auto& v : huff_dist_code_len) v = 5;      // Distance codes 0-31 are represented by (fixed-length) 5-bit codes
+
+            return std::make_tuple(
+                huffman_decoder(huff_lit_code_len.data(), nr_lit_alphabets),
+                huffman_decoder(huff_dist_code_len.data(), nr_dist_alphabets));
+        }
+
+        static std::array<huffman_decoder::code_length_t, nr_clen_alphabets> read_huffman_length_length_table(bit_stream& bit_stream, size_t symbols_from_source)
+        {
+            if (symbols_from_source > nr_clen_alphabets) throw std::runtime_error("invalid argument: symbols_from_source too large");
+
+            std::array<huffman_decoder::code_length_t, nr_clen_alphabets> result{};
+            static constexpr size_t order[nr_clen_alphabets] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+            for (size_t i = 0; i < symbols_from_source; ++i) result[order[i]] = static_cast<uint8_t>(bit_stream.read(3));
+            return result;
+        }
+
+        template <size_t length_length>
+        static std::array<huffman_decoder::code_length_t, length_length> read_huffman_length_table(const huffman_decoder& length_decoder, bit_stream& bit_stream, size_t symbols_from_source)
+        {
+            if (symbols_from_source > length_length) throw std::runtime_error("invalid argument: symbols_from_source too large");
+
+            std::array<huffman_decoder::code_length_t, length_length> result{};
+            huffman_decoder::code_length_t prev = 0; // for running length
+            const auto count = symbols_from_source;
+            const auto check = [count](auto i) { return i < count ? i : throw std::runtime_error("invalid bit stream: invalid code lengths set"); };
+            for (size_t i = 0; i < count;)
+            {
+                huffman_decoder::code_length_t code = length_decoder.read_next(bit_stream);
+                if (code <= 15) result[check(i++)] = prev = code;                                                        // Represent code lengths of 0 - 15
+                else if (code == 16) for (auto x = i + bit_stream.read(2) + 3; i < x; ++i) result[check(i)] = prev;      // Copy the previous code length 3 - 6 times.
+                else if (code == 17) for (auto x = i + bit_stream.read(3) + 3; i < x; ++i) result[check(i)] = prev = 0;  // Repeat a code length of 0 for 3 - 10 times.
+                else if (code == 18) for (auto x = i + bit_stream.read(7) + 11; i < x; ++i) result[check(i)] = prev = 0; // Repeat a code length of 0 for 11 - 138 times
+                else throw std::runtime_error("invalid sequence: invalid code lengths set");
+            }
+            return result;
+        }
+
+        static std::tuple<huffman_decoder, huffman_decoder> build_dynamic_huffman_code_decoder(bit_stream& bit_stream)
+        // -> std::tuple<literals_decoder, distance_decoder>
+        {
+            const unsigned HLIT = bit_stream.read(5) + 257;
+            const unsigned HDIST = bit_stream.read(5) + 1;
+            const unsigned HCLEN = bit_stream.read(4) + 4;
+            if (HLIT < 257 || HLIT > 286) throw std::runtime_error("invalid bit stream: HLIT is out of range.");
+            if (HDIST < 1 || HDIST > 32) throw std::runtime_error("invalid bit stream: HDIST is out of range.");
+            if (HCLEN < 4 || HCLEN > 19) throw std::runtime_error("invalid bit stream: HCLEN is out of range.");
+
+            const auto huff_code_len = read_huffman_length_length_table(bit_stream, HCLEN);
+            const auto length_decoder = huffman_decoder(huff_code_len.data(), nr_clen_alphabets);
+            const auto huff_lit_code_len = read_huffman_length_table<nr_lit_alphabets>(length_decoder, bit_stream, HLIT);
+            const auto huff_dist_code_len = read_huffman_length_table<nr_dist_alphabets>(length_decoder, bit_stream, HDIST);
+
+            return std::make_tuple(
+                huffman_decoder(huff_lit_code_len.data(), HLIT),
+                huffman_decoder(huff_dist_code_len.data(), HDIST));
+        }
+
+        struct length_code_table_entry
+        {
+            unsigned length : 16;
+            unsigned extra_bits : 16;
+        } static constexpr length_code_table[] = {
+            /* 257 */ {3, 0}, /* 258 */ {4, 0}, /* 259 */ {5, 0}, /* 260 */ {6, 0}, /* 261 */ {7, 0},
+            /* 262 */ {8, 0}, /* 263 */ {9, 0}, /* 264 */ {10, 0}, /* 265 */ {11, 1}, /* 266 */ {13, 1},
+            /* 267 */ {15, 1}, /* 268 */ {17, 1}, /* 269 */ {19, 2}, /* 270 */ {23, 2}, /* 271 */ {27, 2},
+            /* 272 */ {31, 2}, /* 273 */ {35, 3}, /* 274 */ {43, 3}, /* 275 */ {51, 3}, /* 276 */ {59, 3},
+            /* 277 */ {67, 4}, /* 278 */ {83, 4}, /* 279 */ {99, 4}, /* 280 */ {115, 4}, /* 281 */ {131, 5},
+            /* 282 */ {163, 5}, /* 283 */ {195, 5}, /* 284 */ {227, 5}, /* 285 */ {258, 0},
+        };
+
+        struct distance_code_table_entry
+        {
+            unsigned distance : 16;
+            unsigned extra_bits : 16;
+        } static constexpr distance_code_table[] = {
+            /*  0 */ {1, 0}, /*  1 */ {2, 0}, /*  2 */ {3, 0}, /*  3 */ {4, 0}, /*  4 */ {5, 1},
+            /*  5 */ {7, 1}, /*  6 */ {9, 2}, /*  7 */ {13, 2}, /*  8 */ {17, 3}, /*  9 */ {25, 3},
+            /* 10 */ {33, 4}, /* 11 */ {49, 4}, /* 12 */ {65, 5}, /* 13 */ {97, 5}, /* 14 */ {129, 6},
+            /* 15 */ {193, 6}, /* 16 */ {257, 7}, /* 17 */ {385, 7}, /* 18 */ {513, 8}, /* 19 */ {769, 8},
+            /* 20 */ {1025, 9}, /* 21 */ {1537, 9}, /* 22 */ {2049, 10}, /* 23 */ {3073, 10}, /* 24 */ {4097, 11},
+            /* 25 */ {6145, 11}, /* 26 */ {8193, 12}, /* 27 */ {12289, 12}, /* 28 */ {16385, 13}, /* 29 */ {24577, 13},
+        };
+
+        class inflate_stream
+        {
+        public:
+            using byte = unsigned char;
+            using byte_span = std::basic_string_view<byte>;
+
+        private:
+            bit_stream input_;
+            window output_window_;
+            huffman_decoder lit_decoder_;
+            huffman_decoder dist_decoder_;
+            std::vector<byte> output_;
+
+            enum struct state_t
+            {
+                block_head,
+                compressed_block,
+                compressed_last_block,
+                end,
+            } next_state_{};
+
+        public:
+            inflate_stream(std::function<size_t(void* buf, size_t len)> upstream)
+                : input_(std::move(upstream))
+            {
+                output_.reserve(65536);
+            }
+
+            // Reads a piece of decompressed bytes
+            byte_span next()
+            {
+                output_.clear();
+                const auto yield = [this] { return byte_span{output_.data(), output_.size()}; };
+
+                switch (next_state_)
+                {
+                case state_t::block_head:
+                    switch (unsigned BFINAL = input_.read(1), BTYPE = input_.read(2); BTYPE)
+                    {
+                    case 0b00: // Non-compressed blocks
+                        {
+                            input_.seek_to_next_byte();
+                            unsigned LEN = input_.read(16);
+                            unsigned NLEN = input_.read(16);
+                            if ((LEN ^ NLEN) != 0xFFFF) throw std::runtime_error("invalid bit stream: invalid stored block lengths");
+                            for (size_t i = 0; i < LEN; ++i)
+                                output_.push_back(output_window_.put(static_cast<byte>(input_.read(8))));
+
+                            next_state_ = !BFINAL ? state_t::block_head : state_t::end;
+                            return yield();
+                        }
+                    case 0b01: // Compression with fixed Huffman codes
+                    case 0b10: // Compression with dynamic Huffman codes
+                        {
+                            auto [lit, dist] = BTYPE == 0b01
+                                                   ? build_fixed_huffman_code_decoder()
+                                                   : build_dynamic_huffman_code_decoder(input_);
+                            lit_decoder_ = std::move(lit);
+                            dist_decoder_ = std::move(dist);
+                            next_state_ = !BFINAL ? state_t::compressed_block : state_t::compressed_last_block;
+                            return next(); // fallthrough
+                        }
+                    default:
+                        throw std::runtime_error("invalid bit stream: invalid block type");
+                    }
+
+                case state_t::compressed_block:
+                case state_t::compressed_last_block:
+                    while (true)
+                    {
+                        input_.fill(32);
+                        unsigned value = lit_decoder_.read_next(input_);
+
+                        if (value <= 255)
+                        {
+                            output_.push_back(output_window_.put(static_cast<byte>(value)));
+                        }
+                        else if (value == 256)
+                        {
+                            next_state_ = (next_state_ != state_t::compressed_last_block) ? state_t::block_head : state_t::end;
+                            return !output_.empty() ? yield() : next();
+                        }
+                        else if (value <= 285) // 257..285
+                        {
+                            value -= 257;
+                            const auto l = value < std::size(length_code_table) ? length_code_table[value] : throw std::runtime_error("invalid bit stream: out of length code table");
+                            const auto length = l.length + input_.read(l.extra_bits);
+
+                            value = dist_decoder_.read_next(input_);
+                            const auto d = value < std::size(distance_code_table) ? distance_code_table[value] : throw std::runtime_error("invalid bit stream: out of distance code table");
+                            const auto distance = -static_cast<ptrdiff_t>(d.distance + input_.read(d.extra_bits));
+
+                            if (std::min<ptrdiff_t>(static_cast<ptrdiff_t>(output_window_.cursor()), 32768) + distance < 0)
+                                throw std::runtime_error("invalid bit stream: invalid distance too far back");
+
+                            for (size_t i = 0; i < length; ++i) // max 258 bytes
+                                output_.push_back(output_window_.reput(distance));
+                        }
+                        else
+                        {
+                            throw std::runtime_error("invalid bit stream: invalid alphabet");
+                        }
+
+                        if (output_.size() >= 65000)
+                            return yield();
+                    }
+
+                case state_t::end:
+                    return yield(); // empty
+
+                default:
+                    throw std::logic_error("bug: invalid status");
+                }
+            }
+        };
+
+        class inflate_stream_buffered
+        {
+            inflate_stream stream_;
+            inflate_stream::byte_span current_;
+
+        public:
+            inflate_stream_buffered(std::function<size_t(void* buf, size_t len)> upstream) : stream_(std::move(upstream)) { }
+
+            size_t read(void* buf, size_t len)
+            {
+                size_t tot = 0;
+                while (len - tot)
+                {
+                    if (current_.empty()) current_ = stream_.next();
+                    if (current_.empty()) break;
+                    auto sz = std::min(len - tot, current_.size());
+                    memcpy(buf, current_.data(), sz);
+                    current_ = current_.substr(sz);
+                    buf = static_cast<unsigned char*>(buf) + sz;
+                    tot += sz;
+                }
+                return tot;
+            }
+        };
+    }
+
 #ifdef NANONZIP_ENABLE_ZLIB
     /// Inflate stream
     struct zip_file_reader::zlib_inflate_impl
@@ -433,7 +929,7 @@ namespace nanonzip
         ~bzip2_decompress_impl() { ::BZ2_bzDecompressEnd(&bz_stream_); }
 
         template <class read_input_fun = std::function<ssize32_t(void* input_buf, ssize32_t input_len)>,
-                  std::enable_if_t<std::is_invocable_r_v<ssize32_t, read_input_fun, void*, ssize32_t>>* = nullptr>
+            std::enable_if_t<std::is_invocable_r_v<ssize32_t, read_input_fun, void*, ssize32_t>>* = nullptr>
         ssize32_t decompress(void* output_buf, ssize32_t output_len, read_input_fun&& read_input)
         {
             output_len = static_cast<ssize32_t>(std::min<intmax_t>(output_len, output_remain_bytes_));
@@ -507,14 +1003,21 @@ namespace nanonzip
         case compression_method_t::stored: // no compress
             break;
 
-#ifdef NANONZIP_ENABLE_ZLIB
         case compression_method_t::deflate:
-            read_file = [lower = std::move(read_file), inflate = std::make_shared<zlib_inflate_impl>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
+#ifdef NANONZIP_ENABLE_ZLIB
+            read_file = [lower = std::move(read_file), stream = std::make_shared<zlib_inflate_impl>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
             {
-                return inflate->inflate(buffer, size, lower);
+                return stream->inflate(buffer, size, lower);
             };
-            break;
+#else
+            read_file = [stream = std::make_shared<inflate::inflate_stream_buffered>(
+                    [upstream = std::move(read_file)](void* buf, size_t len)-> size_t { return static_cast<size_t>(upstream(buf, static_cast<int>(len))); }
+                )](void* buf, ssize32_t sz) mutable -> ssize32_t
+                {
+                    return static_cast<ssize32_t>(stream->read(buf, static_cast<size_t>(sz)));
+                };
 #endif
+            break;
 
 #ifdef NANONZIP_ENABLE_BZIP2
         case compression_method_t::bzip2:
@@ -534,6 +1037,11 @@ namespace nanonzip
         {
             size = lower(buffer, size);
             current_crc32 = crc32_impl::crc32(buffer, static_cast<uint32_t>(size), current_crc32);
+
+            if ((size == 0 && length > 0) || size > length)
+            {
+                throw std::runtime_error("file length not match!");
+            }
 
             if (length -= size; length == 0)
             {
