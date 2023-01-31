@@ -164,7 +164,8 @@ namespace nanonzip
 
 #pragma pack(pop)
 
-    NANONZIP_EXPORT file_header file_header::from_central_directory_header(const central_directory_header* cdh)
+
+    [[nodiscard]] static file_header file_header_from_central_directory_header(const central_directory_header* cdh)
     {
         file_header r{};
         r.general_purpose_bit_flag = cdh->general_purpose_bit_flag;
@@ -173,14 +174,13 @@ namespace nanonzip
 
         // last_mod_timestamp
         {
-            std::tm tm{
-                /* .tm_sec  = */ std::clamp((cdh->last_mod_file_time >> 0 & 0x1f) * 2, 0, 59),
-                /* .tm_min  = */ std::clamp(cdh->last_mod_file_time >> 5 & 0x3f, 0, 59),
-                /* .tm_hour = */ std::clamp(cdh->last_mod_file_time >> 11 & 0x1f, 0, 23),
-                /* .tm_mday = */ std::clamp(cdh->last_mod_file_date >> 0 & 0x1f, 1, 31),
-                /* .tm_mon  = */ std::clamp(cdh->last_mod_file_date >> 5 & 0x0f, 1, 12) - 1,
-                /* .tm_year = */ std::clamp(cdh->last_mod_file_date >> 9 & 0x7f, 0, 128) + 1980 - 1900,
-            };
+            std::tm tm{};
+            tm.tm_sec = std::clamp((cdh->last_mod_file_time >> 0 & 0x1f) * 2, 0, 59);
+            tm.tm_min = std::clamp(cdh->last_mod_file_time >> 5 & 0x3f, 0, 59);
+            tm.tm_hour = std::clamp(cdh->last_mod_file_time >> 11 & 0x1f, 0, 23);
+            tm.tm_mday = std::clamp(cdh->last_mod_file_date >> 0 & 0x1f, 1, 31);
+            tm.tm_mon = std::clamp(cdh->last_mod_file_date >> 5 & 0x0f, 1, 12) - 1;
+            tm.tm_year = std::clamp(cdh->last_mod_file_date >> 9 & 0x7f, 0, 128) + 1980 - 1900;
             r.last_mod_timestamp = std::mktime(&tm);
 
             if (auto ut = cdh->find_extra_field(0x5455)) // Extended Timestamp Extra Field
@@ -223,8 +223,9 @@ namespace nanonzip
         std::string buffer(max_read_size_from_tail, '\0');
         {
             auto read_size = static_cast<int>(std::min<std::streamoff>(total_zip_file_size, max_read_size_from_tail));
-            auto read_cursor = total_zip_file_size - read_size;
-            read_zip_file(read_cursor, buffer.data() + max_read_size_from_tail - read_size, read_size);
+            auto read_from = total_zip_file_size - read_size;
+            if (read_zip_file(read_from, buffer.data() + max_read_size_from_tail - read_size, read_size) != read_size)
+                throw std::runtime_error("failed to read end_of_central_directory_record");
         }
 
         // signature of "End of central directory record"
@@ -258,26 +259,26 @@ namespace nanonzip
         if (cd->size_of_the_central_directory > 1073741824) // 1GiB
             throw std::runtime_error("too large central directory");
 
+        const std::streamoff directory_starts_at = static_cast<std::streamoff>(cd->offset_of_start_of_central_directory_with_respect_to_the_starting_disk_number);
+        const size_t directory_size = static_cast<int>(cd->size_of_the_central_directory);
+        const size_t count = static_cast<int>(cd->total_number_of_entries_in_the_central_directory);
+
         // reads whole central directory
-        auto buffer = std::shared_ptr(std::make_unique<char[]>(cd->size_of_the_central_directory));
-        {
-            auto read_cursor = static_cast<std::streamoff>(cd->offset_of_start_of_central_directory_with_respect_to_the_starting_disk_number);
-            auto read_size = static_cast<int>(cd->size_of_the_central_directory);
-            read_zip_file(read_cursor, buffer.get(), read_size);
-        }
+        auto buffer = std::shared_ptr(std::make_unique<char[]>(directory_size));
+        if (read_zip_file(directory_starts_at, buffer.get(), static_cast<int>(directory_size)) != static_cast<int>(directory_size))
+            throw std::runtime_error("failed to read central_directory");
 
         // splits it to entries
         std::vector<std::shared_ptr<const central_directory_header>> central_directory;
-        size_t dir_size = cd->size_of_the_central_directory;
-        size_t count = cd->total_number_of_entries_in_the_central_directory;
-        size_t offset = 0;
         central_directory.reserve(count);
-        for (size_t i = 0; i < count && offset < dir_size; ++i)
+
+        size_t offset = 0;
+        for (size_t i = 0; i < count && offset < directory_size; ++i)
         {
             auto cdh = reinterpret_cast<const central_directory_header*>(buffer.get() + offset);
             if (cdh->central_file_header_signature != central_directory_header::SIGNATURE)
                 throw std::runtime_error("unknown file format");
-            if (offset + cdh->total_header_size() > dir_size)
+            if (offset + cdh->total_header_size() > directory_size)
                 throw std::runtime_error("unknown file format");
 
             offset += cdh->total_header_size();
@@ -288,7 +289,7 @@ namespace nanonzip
         std::vector<file_header> central_directory_parsed;
         central_directory_parsed.reserve(count);
         for (const auto& h : central_directory)
-            central_directory_parsed.push_back(file_header::from_central_directory_header(h.get()));
+            central_directory_parsed.push_back(file_header_from_central_directory_header(h.get()));
 
         return central_directory_parsed;
     }
@@ -393,30 +394,30 @@ namespace nanonzip
         }
     }
 
-    /// Decrypt stream
-    struct zip_file_reader::decrypt_impl
+    /// Traditional PKWARE Decryption
+    struct traditional_pkware_decryption
     {
+        using byte = uint8_t;
         uint32_t k0_ = 305419896;
         uint32_t k1_ = 591751049;
         uint32_t k2_ = 878082192;
 
         static constexpr inline auto crc32_table = crc32::crc32_table<0xEDB88320>;
 
-        decrypt_impl(std::string_view password)
+        traditional_pkware_decryption(std::string_view password)
         {
             for (char c : password)
                 update_keys(c);
         }
 
-        void update_keys(uint8_t c)
+        void update_keys(byte c)
         {
             k0_ = crc32_table[static_cast<uint8_t>(k0_ ^ c)] ^ k0_ >> 8;
-            k1_ = k1_ + static_cast<uint8_t>(k0_);
-            k1_ = k1_ * 134775813 + 1;
-            k2_ = crc32_table[static_cast<uint8_t>(k2_ ^ static_cast<uint8_t>(k1_ >> 24))] ^ k2_ >> 8;
+            k1_ = (k1_ + static_cast<uint8_t>(k0_)) * 134775813 + 1;
+            k2_ = crc32_table[static_cast<uint8_t>(k2_ ^ (k1_ >> 24))] ^ k2_ >> 8;
         }
 
-        uint8_t process_byte(uint8_t b)
+        byte process_byte(byte b)
         {
             uint32_t u = k2_ | 2;
             b ^= static_cast<uint8_t>(u * (u ^ 1) >> 8);
@@ -426,12 +427,11 @@ namespace nanonzip
 
         void process_buffer(void* buffer, size_t sz)
         {
-            auto buf = static_cast<uint8_t*>(buffer);
+            auto buf = static_cast<byte*>(buffer);
             for (size_t i = 0; i < sz; ++i)
                 buf[i] = process_byte(buf[i]);
         }
     };
-
 
     // DEFLATE Compressed Data Format Specification version 1.3
     // https://www.ietf.org/rfc/rfc1951.txt
@@ -910,14 +910,15 @@ namespace nanonzip
 
 #ifdef NANONZIP_ENABLE_ZLIB
     /// Inflate stream
-    struct zip_file_reader::zlib_inflate_impl
+    struct zlib_inflate_stream
     {
+        using ssize32_t = int32_t;
         z_stream z_stream_{};
         std::streamoff output_remain_bytes_{};
         std::vector<Byte> input_buffer_{};
         size_t input_buffer_used_{};
 
-        zlib_inflate_impl(std::streamoff output_data_size, ssize32_t buffer_size = 262144)
+        zlib_inflate_stream(std::streamoff output_data_size, ssize32_t buffer_size = 262144)
             : output_remain_bytes_(output_data_size)
             , input_buffer_(buffer_size)
             , input_buffer_used_(input_buffer_.size())
@@ -926,11 +927,11 @@ namespace nanonzip
                 throw std::runtime_error("zlib::init error");
         }
 
-        zlib_inflate_impl(const zlib_inflate_impl& other) = delete;
-        zlib_inflate_impl(zlib_inflate_impl&& other) noexcept = delete;
-        zlib_inflate_impl& operator=(const zlib_inflate_impl& other) = delete;
-        zlib_inflate_impl& operator=(zlib_inflate_impl&& other) noexcept = delete;
-        ~zlib_inflate_impl() { inflateEnd(&z_stream_); }
+        zlib_inflate_stream(const zlib_inflate_stream& other) = delete;
+        zlib_inflate_stream(zlib_inflate_stream&& other) noexcept = delete;
+        zlib_inflate_stream& operator=(const zlib_inflate_stream& other) = delete;
+        zlib_inflate_stream& operator=(zlib_inflate_stream&& other) noexcept = delete;
+        ~zlib_inflate_stream() { inflateEnd(&z_stream_); }
 
         template <class read_input_fun = std::function<ssize32_t(void* input_buf, ssize32_t input_len)>,
                   std::enable_if_t<std::is_invocable_r_v<ssize32_t, read_input_fun, void*, ssize32_t>>* = nullptr>
@@ -964,14 +965,15 @@ namespace nanonzip
 
 #ifdef NANONZIP_ENABLE_BZIP2
     /// bzip2 decompress stream
-    struct zip_file_reader::bzip2_decompress_impl
+    struct bzip2_decompress_stream
     {
+        using ssize32_t = int32_t;
         bz_stream bz_stream_{};
         std::streamoff output_remain_bytes_{};
         std::vector<char> input_buffer_{};
         size_t input_buffer_used_{};
 
-        bzip2_decompress_impl(std::streamoff output_data_size, ssize32_t buffer_size = 262144)
+        bzip2_decompress_stream(std::streamoff output_data_size, ssize32_t buffer_size = 262144)
             : output_remain_bytes_(output_data_size)
             , input_buffer_(buffer_size)
             , input_buffer_used_(input_buffer_.size())
@@ -980,11 +982,11 @@ namespace nanonzip
                 throw std::runtime_error("bzlib2::init error");
         }
 
-        bzip2_decompress_impl(const bzip2_decompress_impl& other) = delete;
-        bzip2_decompress_impl(bzip2_decompress_impl&& other) noexcept = delete;
-        bzip2_decompress_impl& operator=(const bzip2_decompress_impl& other) = delete;
-        bzip2_decompress_impl& operator=(bzip2_decompress_impl&& other) noexcept = delete;
-        ~bzip2_decompress_impl() { ::BZ2_bzDecompressEnd(&bz_stream_); }
+        bzip2_decompress_stream(const bzip2_decompress_stream& other) = delete;
+        bzip2_decompress_stream(bzip2_decompress_stream&& other) noexcept = delete;
+        bzip2_decompress_stream& operator=(const bzip2_decompress_stream& other) = delete;
+        bzip2_decompress_stream& operator=(bzip2_decompress_stream&& other) noexcept = delete;
+        ~bzip2_decompress_stream() { ::BZ2_bzDecompressEnd(&bz_stream_); }
 
         template <class read_input_fun = std::function<ssize32_t(void* input_buf, ssize32_t input_len)>,
             std::enable_if_t<std::is_invocable_r_v<ssize32_t, read_input_fun, void*, ssize32_t>>* = nullptr>
@@ -1018,6 +1020,7 @@ namespace nanonzip
 
     NANONZIP_EXPORT file zip_file_reader::open_file_stream(const file_header& file_header, [[maybe_unused]] std::string_view password) const
     {
+        using ssize32_t = int32_t;
         const std::streamoff uncompressed_size{file_header.uncompressed_size};
         const std::streamoff compressed_size{file_header.compressed_size};
         std::streamoff cursor{file_header.relative_offset_of_local_header};
@@ -1042,9 +1045,10 @@ namespace nanonzip
             return read_size;
         };
 
+        // file is encrypted
         if (file_header.general_purpose_bit_flag & 1)
         {
-            read_file = [lower = std::move(read_file), decrypt = decrypt_impl(password)](void* buffer, ssize32_t size) mutable -> ssize32_t
+            read_file = [lower = std::move(read_file), decrypt = traditional_pkware_decryption(password)](void* buffer, ssize32_t size) mutable -> ssize32_t
             {
                 ssize32_t r = lower(buffer, size);
                 decrypt.process_buffer(buffer, r);
@@ -1053,6 +1057,9 @@ namespace nanonzip
 
             std::byte encryption_header[12]{};
             read_file(encryption_header, 12);
+
+            if (encryption_header[11] != static_cast<std::byte>(file_header.crc_32 >> 24))
+                throw std::runtime_error("supplied password is not correct");
         }
 
         // decompress file
@@ -1063,11 +1070,13 @@ namespace nanonzip
 
         case compression_method_t::deflate:
 #ifdef NANONZIP_ENABLE_ZLIB
-            read_file = [lower = std::move(read_file), stream = std::make_shared<zlib_inflate_impl>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
+            // uses zlib_inflate_stream
+            read_file = [lower = std::move(read_file), stream = std::make_shared<zlib_inflate_stream>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
             {
                 return stream->inflate(buffer, size, lower);
             };
 #else
+            // uses inflate::inflate_stream_buffered
             read_file = [stream = std::make_shared<inflate::inflate_stream_buffered>(
                     [upstream = std::move(read_file)](void* buf, size_t len)-> size_t { return static_cast<size_t>(upstream(buf, static_cast<int>(len))); }
                 )](void* buf, ssize32_t sz) mutable -> ssize32_t
@@ -1079,7 +1088,8 @@ namespace nanonzip
 
 #ifdef NANONZIP_ENABLE_BZIP2
         case compression_method_t::bzip2:
-            read_file = [lower = std::move(read_file), bzlib2 = std::make_shared<bzip2_decompress_impl>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
+            // uses bzip2_decompress_stream
+            read_file = [lower = std::move(read_file), bzlib2 = std::make_shared<bzip2_decompress_stream>(uncompressed_size)](void* buffer, ssize32_t size) mutable -> ssize32_t
             {
                 return bzlib2->decompress(buffer, size, lower);
             };

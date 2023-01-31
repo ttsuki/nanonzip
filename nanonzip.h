@@ -10,32 +10,23 @@
 //#define NANONZIP_ENABLE_ZLIB
 //#define NANONZIP_ENABLE_BZIP2
 
-#include <cstring>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <ctime>
 
-#include <algorithm>
-#include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iosfwd>
 #include <memory>
-#include <mutex>
-#include <stdexcept>
-#include <string>
 #include <string_view>
-#include <utility>
+#include <istream>
+#include <fstream>
+#include <filesystem>
+#include <functional>
+#include <stdexcept>
 #include <vector>
+#include <utility>
+#include <mutex>
 
 namespace nanonzip
 {
-    struct local_file_header;
-    struct central_directory_header;
-    struct zip64_end_of_central_directory_record;
-    struct zip64_end_of_central_directory_locator;
-    struct end_of_central_directory_record;
-
     enum struct compression_method_t : uint16_t
     {
         stored = 0,
@@ -54,13 +45,12 @@ namespace nanonzip
         std::streamoff compressed_size{};
         std::streamoff relative_offset_of_local_header{};
         std::filesystem::path path{};
-        [[nodiscard]] static file_header from_central_directory_header(const central_directory_header* cdh);
     };
 
     /// Represents a file in zip file.
     class file
     {
-        file_header header_;
+        file_header header_{};
         std::function<size_t(void* buf, size_t len)> read_{};
 
     public:
@@ -160,15 +150,8 @@ namespace nanonzip
         }
 
     private:
-        using ssize32_t = int32_t;
-        struct decrypt_impl;
-        struct zlib_inflate_impl;
-        struct bzip2_decompress_impl;
-
         seek_and_read_file_function read_zip_file_{};
         std::vector<file_header> central_directory_{};
-
-        /// Open a file stream in zip file.
         [[nodiscard]] file open_file_stream(const file_header& file_header, std::string_view password) const;
     };
 }
