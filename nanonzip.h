@@ -162,7 +162,6 @@ namespace nanonzip
     private:
         using ssize32_t = int32_t;
         struct decrypt_impl;
-        struct crc32_impl;
         struct zlib_inflate_impl;
         struct bzip2_decompress_impl;
 
