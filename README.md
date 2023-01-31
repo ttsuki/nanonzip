@@ -1,7 +1,7 @@
 nano𝒏zip
 ========
 
-A study for simple unzip program with zlib/bzip2.
+A study for simple unzip program (with optional zlib/bzip2).
 
 for zip files as game application assets bundle.
 
@@ -10,8 +10,8 @@ for zip files as game application assets bundle.
   - basic password encrypted zip file support.
   - crc32 calculation support.
   - store algorithm (= method 0) support.
-  - deflate algorithm (= method 8) support. (with zlib)
-  - bzip2 compress algorithm (= method 12) support. (with bzip2)
+  - deflate algorithm (= method 8) support (with built-in implementation or zlib).
+  - bzip2 compress algorithm (= method 12) support (with bzip2).
   - open zip file from memory (or user defined file-reading function).
 
 ## files
@@ -20,7 +20,7 @@ for zip files as game application assets bundle.
   - [`test/`](test/): 
     - [`test/nanonzip.test.cpp`](test/nanonzip.test.cpp): a sample unzip program
 
-## library usage
+## library look and feel
 
 from [`test/nanonzip.test.cpp`](test/nanonzip.test.cpp)
 
@@ -71,8 +71,8 @@ from [`test/nanonzip.test.cpp`](test/nanonzip.test.cpp)
 
 ## env
   - C++17
-  - zlib (optional)
-  - bzip2 (optional)
+  - zlib (optional, for instead of built-in inflate algorithm implementation)
+  - bzip2 (optional, to support compression_type=12)
 
 ## Visual Studio
   - [`test/nanonzip.test.sln`](test/nanonzip.test.sln) with vcpkg integration
@@ -85,7 +85,14 @@ from [`test/nanonzip.test.cpp`](test/nanonzip.test.cpp)
 ## g++
 
 -  g++-11
+
+    ```sh
+    g++ -std=c++17 -I. nanonzip.cpp test/nanonzip.test.cpp 
     ```
+    
+    or
+
+    ```sh
     g++ -std=c++17 -I. \
       -DNANONZIP_ENABLE_ZLIB -DNANONZIP_ENABLE_BZIP2 \
       nanonzip.cpp test/nanonzip.test.cpp -lz -lbz2
