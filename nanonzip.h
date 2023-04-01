@@ -27,16 +27,16 @@
 
 namespace nanonzip
 {
-    enum struct compression_method_t : uint16_t
-    {
-        stored = 0,
-        deflate = 8,
-        bzip2 = 12,
-    };
-
     /// Represents a file header in zip file.
     struct file_header
     {
+        enum struct compression_method_t : std::uint16_t
+        {
+            stored = 0,
+            deflate = 8,
+            bzip2 = 12,
+        };
+
         uint16_t general_purpose_bit_flag{};
         compression_method_t compression_method{};
         uint32_t crc_32{};
@@ -47,18 +47,14 @@ namespace nanonzip
         std::filesystem::path path{};
     };
 
-    /// Represents a file in zip file.
+    /// Represents a file stream in zip file.
     class file
     {
-        file_header header_{};
-        std::function<size_t(void* buf, size_t len)> read_{};
-
     public:
+        using file_read_function = std::function<size_t(void* buf, size_t len)>;
+
         file() = default;
-
-        file(file_header header, std::function<size_t(void* buf, size_t len)> read)
-            : header_(std::move(header)), read_(std::move(read)) { }
-
+        file(file_header header, file_read_function read) : header_(std::move(header)), read_(std::move(read)) { }
         file(const file& other) = delete;
         file(file&& other) noexcept = default;
         file& operator=(const file& other) = delete;
@@ -69,34 +65,14 @@ namespace nanonzip
         [[nodiscard]] const std::filesystem::path& path() const noexcept { return header_.path; }
         [[nodiscard]] const std::streamoff& size() const noexcept { return header_.uncompressed_size; }
         [[nodiscard]] size_t read(void* buffer, size_t size) { return read_(buffer, size); }
+
+    private:
+        file_header header_{};
+        file_read_function read_{};
     };
 
-    /// Reads the file `len` bytes from the position represented by `cursor` and stores into `buf`, then returns `len`
-    using seek_and_read_file_function = std::function<int(std::streamoff cursor, void* buf, int len)>;
-
-    /// a sample of istream interface
-    struct istream
-    {
-        void read(void* s, int n);
-        void seekg(std::streamoff pos);
-    };
-
-    /// Makes thread-safe seek_and_read_file_function from std::istream-like implementation.
-    template <class istream>
-    static seek_and_read_file_function make_seek_and_read_function_for_istream(
-        std::shared_ptr<istream> stream,
-        std::streamoff total_length)
-    {
-        return [mutex_ = std::make_shared<std::mutex>(), stream, total_length](std::streamoff cursor, void* buf, int size) mutable -> int
-        {
-            std::lock_guard lock(*mutex_);
-            if (cursor + size > total_length) throw std::out_of_range("cursor + size > total_length");
-            stream->seekg(cursor);
-            stream->read(static_cast<char*>(buf), size);
-            cursor += size;
-            return size;
-        };
-    }
+    /// Function reads the file `len` bytes from the position represented by `cursor` and stores into `buf`, then returns `len`
+    using file_seek_read_function = std::function<int(std::streamoff cursor, void* buf, int len)>;
 
     /// ZIP file reader
     class zip_file_reader
@@ -104,20 +80,17 @@ namespace nanonzip
     public:
         zip_file_reader() = default;
 
-        /// Opens and parses a zip file.
-        zip_file_reader(const std::filesystem::path& zip_file)
-            : zip_file_reader(std::make_shared<std::ifstream>(zip_file, std::ios::in | std::ios::binary)) { }
-
-        /// Opens and parses a zip file from istream.
-        zip_file_reader(const std::shared_ptr<std::istream>& zip_file)
-            : zip_file_reader(zip_file, static_cast<std::streamoff>(zip_file->seekg(0, std::ios::end).tellg())) { }
-
-        /// Opens and parses a zip file from istream.
-        zip_file_reader(const std::shared_ptr<std::istream>& zip_file, std::streamoff length)
-            : zip_file_reader(nanonzip::make_seek_and_read_function_for_istream<std::istream>(zip_file, length), length) { }
-
         /// Opens and parses a zip file from stream function.
-        zip_file_reader(seek_and_read_file_function zip_file, std::streamoff length);
+        zip_file_reader(file_seek_read_function zip_file, std::streamoff length);
+
+        /// Opens and parses a zip file.
+        zip_file_reader(const std::filesystem::path& zip_file);
+
+        /// Opens and parses a zip file from istream.
+        zip_file_reader(const std::shared_ptr<std::istream>& zip_file);
+
+        /// Opens and parses a zip file from istream.
+        zip_file_reader(const std::shared_ptr<std::istream>& zip_file, std::streamoff length);
 
         zip_file_reader(const zip_file_reader& other) = delete;
         zip_file_reader(zip_file_reader&& other) noexcept = default;
@@ -150,10 +123,38 @@ namespace nanonzip
         }
 
     private:
-        seek_and_read_file_function read_zip_file_{};
+        file_seek_read_function read_zip_file_{};
         std::vector<file_header> central_directory_{};
         [[nodiscard]] file open_file_stream(const file_header& file_header, std::string_view password) const;
     };
+
+    /// a sample of istream interface
+    struct istream
+    {
+        void read(void* s, int n);
+        void seekg(std::streamoff pos);
+    };
+
+    /// Makes thread-safe file_seek_read_function from std::istream-like implementation.
+    template <class istream>
+    static file_seek_read_function make_file_seek_read_function_for_istream(std::shared_ptr<istream> stream, std::streamoff total_length)
+    {
+        return [mutex_ = std::make_shared<std::mutex>(), stream, total_length](std::streamoff cursor, void* buf, int size) mutable -> int
+        {
+            std::lock_guard lock(*mutex_);
+            if (cursor + size > total_length) throw std::out_of_range("cursor + size > total_length");
+            stream->seekg(cursor);
+            stream->read(static_cast<char*>(buf), size);
+            cursor += size;
+            return size;
+        };
+    }
+
+    inline zip_file_reader::zip_file_reader(const std::filesystem::path& zip_file) : zip_file_reader(std::make_shared<std::ifstream>(zip_file, std::ios::in | std::ios::binary)) { }
+    inline zip_file_reader::zip_file_reader(const std::shared_ptr<std::istream>& zip_file) : zip_file_reader(zip_file, static_cast<std::streamoff>(zip_file->seekg(0, std::ios::end).tellg())) { }
+    inline zip_file_reader::zip_file_reader(const std::shared_ptr<std::istream>& zip_file, std::streamoff length) : zip_file_reader(nanonzip::make_file_seek_read_function_for_istream<std::istream>(zip_file, length), length) { }
+
+    using compression_method_t = file_header::compression_method_t;
 }
 
 #endif // #ifndef NANONZIP_H_INCLUDED

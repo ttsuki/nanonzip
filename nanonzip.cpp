@@ -169,7 +169,7 @@ namespace nanonzip
     {
         file_header r{};
         r.general_purpose_bit_flag = cdh->general_purpose_bit_flag;
-        r.compression_method = static_cast<enum compression_method_t>(cdh->compression_method);
+        r.compression_method = static_cast<file_header::compression_method_t>(cdh->compression_method);
         r.crc_32 = cdh->crc_32;
 
         // last_mod_timestamp
@@ -216,7 +216,7 @@ namespace nanonzip
 
     // Finds the end of central directory record from a zip file.
     template <class end_of_central_directory_record = end_of_central_directory_record>
-    [[nodiscard]] static std::shared_ptr<const end_of_central_directory_record> find_end_of_central_directory_record(const seek_and_read_file_function& read_zip_file, std::streamoff total_zip_file_size)
+    [[nodiscard]] static std::shared_ptr<const end_of_central_directory_record> find_end_of_central_directory_record(const file_seek_read_function& read_zip_file, std::streamoff total_zip_file_size)
     {
         // reads file from tail 
         constexpr int max_read_size_from_tail = 4096;
@@ -254,7 +254,7 @@ namespace nanonzip
 
     // Reads the central directory from a zip file. 
     template <class end_of_central_directory_record = end_of_central_directory_record>
-    [[nodiscard]] static std::vector<file_header> read_central_directory(const seek_and_read_file_function& read_zip_file, const end_of_central_directory_record* cd)
+    [[nodiscard]] static std::vector<file_header> read_central_directory(const file_seek_read_function& read_zip_file, const end_of_central_directory_record* cd)
     {
         if (cd->size_of_the_central_directory > 1073741824) // 1GiB
             throw std::runtime_error("too large central directory");
@@ -294,7 +294,7 @@ namespace nanonzip
         return central_directory_parsed;
     }
 
-    NANONZIP_EXPORT zip_file_reader::zip_file_reader(seek_and_read_file_function zip_file, std::streamoff length) : read_zip_file_(std::move(zip_file))
+    NANONZIP_EXPORT zip_file_reader::zip_file_reader(file_seek_read_function zip_file, std::streamoff length) : read_zip_file_(std::move(zip_file))
     {
         if (auto ecd64 = find_end_of_central_directory_record<zip64_end_of_central_directory_record>(read_zip_file_, length))
             this->central_directory_ = read_central_directory<zip64_end_of_central_directory_record>(read_zip_file_, ecd64.get());
